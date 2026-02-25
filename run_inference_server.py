@@ -18,6 +18,8 @@ def run_server():
     if platform.system() == "Windows":
         server_path = os.path.join(build_dir, "bin", "Release", "llama-server.exe")
         if not os.path.exists(server_path):
+            server_path = os.path.join(build_dir, "bin", "llama-server.exe")
+        if not os.path.exists(server_path):
             server_path = os.path.join(build_dir, "bin", "llama-server")
     else:
         server_path = os.path.join(build_dir, "bin", "llama-server")

@@ -89,22 +89,22 @@ def get_model_name():
         return SUPPORTED_HF_MODELS[args.hf_repo]["model_name"]
     return os.path.basename(os.path.normpath(args.model_dir))
 
-def run_command(command, shell=False, log_step=None):
+def run_command(command, shell=False, log_step=None, env=None):
     """Run a system command and ensure it succeeds."""
     if log_step:
         log_file = os.path.join(args.log_dir, log_step + ".log")
         with open(log_file, "w") as f:
             try:
-                subprocess.run(command, shell=shell, check=True, stdout=f, stderr=f)
+                subprocess.run(command, shell=shell, check=True, stdout=f, stderr=f, env=env)
             except subprocess.CalledProcessError as e:
                 logging.error(f"Error occurred while running command: {e}, check details in {log_file}")
                 sys.exit(1)
     else:
         try:
-            subprocess.run(command, shell=shell, check=True)
+            subprocess.run(command, shell=shell, check=True, env=env)
         except subprocess.CalledProcessError as e:
             logging.error(f"Error occurred while running command: {e}")
-        sys.exit(1)
+            sys.exit(1)
 
 def prepare_model():
     _, arch = system_info()
@@ -140,17 +140,31 @@ def prepare_model():
                 else:
                     run_command(["./build/bin/llama-quantize", f32_model, i2s_model, "I2_S", "1"], log_step="quantize_to_i2s")
             else:
+                quantize_candidates = [
+                    "./build/bin/Release/llama-quantize.exe",
+                    "./build/bin/llama-quantize.exe",
+                    "./build/bin/Release/llama-quantize",
+                    "./build/bin/llama-quantize",
+                ]
+                quantize_bin = next((path for path in quantize_candidates if os.path.exists(path)), None)
+                if quantize_bin is None:
+                    logging.error("Could not find llama-quantize binary in build/bin.")
+                    sys.exit(1)
                 if quant_embd:
-                    run_command(["./build/bin/Release/llama-quantize", "--token-embedding-type", "f16", f32_model, i2s_model, "I2_S", "1", "1"], log_step="quantize_to_i2s")
+                    run_command([quantize_bin, "--token-embedding-type", "f16", f32_model, i2s_model, "I2_S", "1", "1"], log_step="quantize_to_i2s")
                 else:
-                    run_command(["./build/bin/Release/llama-quantize", f32_model, i2s_model, "I2_S", "1"], log_step="quantize_to_i2s")
+                    run_command([quantize_bin, f32_model, i2s_model, "I2_S", "1"], log_step="quantize_to_i2s")
 
         logging.info(f"GGUF model saved at {gguf_path}")
     else:
         logging.info(f"GGUF model already exists at {gguf_path}")
 
 def setup_gguf():
-    # Install the pip package
+    # Only needed when we have to convert HF safetensors to GGUF.
+    gguf_path = os.path.join(args.model_dir, "ggml-model-" + args.quant_type + ".gguf")
+    if args.hf_repo is None and os.path.exists(gguf_path) and os.path.getsize(gguf_path) > 0:
+        logging.info(f"GGUF model already exists at {gguf_path}; skipping gguf-py install.")
+        return
     run_command([sys.executable, "-m", "pip", "install", "3rdparty/llama.cpp/gguf-py"], log_step="install_gguf")
 
 def gen_code():
@@ -200,6 +214,44 @@ def gen_code():
             raise NotImplementedError()
 
 
+def _find_vsdevcmd():
+    candidates = [
+        os.path.join("D:\\", "Microsoft Visual Studio", "Common7", "Tools", "VsDevCmd.bat"),
+        os.path.join("C:\\", "Program Files", "Microsoft Visual Studio", "2022", "Community", "Common7", "Tools", "VsDevCmd.bat"),
+        os.path.join("C:\\", "Program Files", "Microsoft Visual Studio", "2022", "Professional", "Common7", "Tools", "VsDevCmd.bat"),
+        os.path.join("C:\\", "Program Files", "Microsoft Visual Studio", "2022", "Enterprise", "Common7", "Tools", "VsDevCmd.bat"),
+        os.path.join("C:\\", "Program Files (x86)", "Microsoft Visual Studio", "2022", "BuildTools", "Common7", "Tools", "VsDevCmd.bat"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _windows_build_env(clang_cl):
+    env = os.environ.copy()
+    if shutil.which("rc") and shutil.which("cl"):
+        return env
+    vsdevcmd = _find_vsdevcmd()
+    if not vsdevcmd:
+        logging.error("Could not find VsDevCmd.bat for Visual Studio 2022.")
+        sys.exit(1)
+    bootstrap = f'"{vsdevcmd}" -arch=x64 -host_arch=x64 >nul && set'
+    completed = subprocess.run(bootstrap, shell=True, capture_output=True, text=True)
+    if completed.returncode != 0:
+        logging.error("Failed to initialize Visual Studio Developer environment.")
+        sys.exit(1)
+    for line in completed.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key and not (key.startswith("%") and key.endswith("%")):
+            env[key] = value
+    llvm_bin = os.path.dirname(clang_cl)
+    env["PATH"] = llvm_bin + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def compile():
     # Check if cmake is installed
     cmake_exists = subprocess.run(["cmake", "--version"], capture_output=True)
@@ -211,9 +263,47 @@ def compile():
         logging.error(f"Arch {arch} is not supported yet")
         exit(0)
     logging.info("Compiling the code using CMake.")
-    run_command(["cmake", "-B", "build", *COMPILER_EXTRA_ARGS[arch], *OS_EXTRA_ARGS.get(platform.system(), []), "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"], log_step="generate_build_files")
-    # run_command(["cmake", "--build", "build", "--target", "llama-cli", "--config", "Release"])
-    run_command(["cmake", "--build", "build", "--config", "Release"], log_step="compile")
+    system = platform.system()
+    build_env = None
+    if system == "Windows":
+        clang_cl = shutil.which("clang-cl") or shutil.which("clang-cl.exe")
+        if not clang_cl:
+            # Common default installation paths.
+            for candidate in [
+                os.path.join("C:\\", "Program Files", "LLVM", "bin", "clang-cl.exe"),
+                os.path.join("C:\\", "Program Files (x86)", "Microsoft Visual Studio", "2022", "BuildTools", "VC", "Tools", "Llvm", "x64", "bin", "clang-cl.exe"),
+                os.path.join("D:\\", "Microsoft Visual Studio", "VC", "Tools", "Llvm", "x64", "bin", "clang-cl.exe"),
+            ]:
+                if os.path.exists(candidate):
+                    clang_cl = candidate
+                    break
+        if not clang_cl:
+            logging.error("clang-cl was not found. Open a VS2022 Developer Command Prompt/PowerShell or add LLVM clang-cl to PATH.")
+            sys.exit(1)
+        build_env = _windows_build_env(clang_cl)
+        configure_cmd = [
+            "cmake",
+            "-B", "build",
+            "-G", "Ninja",
+            *COMPILER_EXTRA_ARGS[arch],
+            f"-DCMAKE_C_COMPILER={clang_cl}",
+            f"-DCMAKE_CXX_COMPILER={clang_cl}",
+        ]
+    else:
+        configure_cmd = [
+            "cmake",
+            "-B", "build",
+            *COMPILER_EXTRA_ARGS[arch],
+            *OS_EXTRA_ARGS.get(system, []),
+            "-DCMAKE_C_COMPILER=clang",
+            "-DCMAKE_CXX_COMPILER=clang++",
+        ]
+    run_command(configure_cmd, log_step="generate_build_files", env=build_env)
+    run_command(
+        ["cmake", "--build", "build", "--config", "Release", "--target", "llama-cli", "llama-quantize", "llama-server"],
+        log_step="compile",
+        env=build_env,
+    )
 
 def main():
     setup_gguf()

@@ -246,6 +246,28 @@ optional arguments:
                         (When this option is turned on, the prompt specified by -p will be used as the system prompt.)
 </pre>
 
+### Web UI (Chat + RAG + Train Jobs)
+```bash
+# Install web UI dependencies
+python -m pip install -r webui/requirements.txt
+
+# Launch the local web console
+python run_webui.py
+```
+
+Then open `http://127.0.0.1:7860`.
+
+What the web UI includes:
+- Streaming chat interface with full generation controls.
+- Runtime controls to start/stop local `llama-server`.
+- RAG indexing over local files/folders for retrieval-augmented responses.
+- Training job panel to launch LoRA fine-tune runs using `webui/train_adapter.py`.
+
+Optional training dependencies:
+```bash
+python -m pip install -r webui/requirements-train.txt
+```
+
 ### Benchmark
 We provide scripts to run the inference benchmark providing a model.
 
