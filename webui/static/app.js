@@ -3,7 +3,9 @@ const state = {
   streamAbort: null,
   lastRequest: null,
   lastResponse: null,
+  lastRetrieval: [],
   serverStatus: null,
+  serverAction: null,
   trainStatus: null,
   ragStatus: null,
 };
@@ -34,6 +36,8 @@ const el = {
   healthBadge: document.getElementById("healthBadge"),
   llamaBadge: document.getElementById("llamaBadge"),
   ragPathsInput: document.getElementById("ragPathsInput"),
+  ragUploadInput: document.getElementById("ragUploadInput"),
+  uploadRagBtn: document.getElementById("uploadRagBtn"),
   chunkSizeInput: document.getElementById("chunkSizeInput"),
   chunkOverlapInput: document.getElementById("chunkOverlapInput"),
   indexRagBtn: document.getElementById("indexRagBtn"),
@@ -41,6 +45,12 @@ const el = {
   ragStatus: document.getElementById("ragStatus"),
   inspector: document.getElementById("inspector"),
   trainBaseModelInput: document.getElementById("trainBaseModelInput"),
+  trainUploadInput: document.getElementById("trainUploadInput"),
+  uploadTrainBtn: document.getElementById("uploadTrainBtn"),
+  trainRawDataInput: document.getElementById("trainRawDataInput"),
+  trainRawFormatInput: document.getElementById("trainRawFormatInput"),
+  trainRawNameInput: document.getElementById("trainRawNameInput"),
+  createRawDatasetBtn: document.getElementById("createRawDatasetBtn"),
   trainDatasetInput: document.getElementById("trainDatasetInput"),
   trainOutputDirInput: document.getElementById("trainOutputDirInput"),
   trainEpochsInput: document.getElementById("trainEpochsInput"),
@@ -52,6 +62,8 @@ const el = {
   startTrainBtn: document.getElementById("startTrainBtn"),
   stopTrainBtn: document.getElementById("stopTrainBtn"),
   trainStatus: document.getElementById("trainStatus"),
+  tabButtons: Array.from(document.querySelectorAll(".tab-btn")),
+  tabPanels: Array.from(document.querySelectorAll(".tab-panel")),
 };
 
 function pretty(obj) {
@@ -74,9 +86,44 @@ function updateInspector() {
     server: state.serverStatus,
     rag: state.ragStatus,
     train: state.trainStatus,
+    retrieval: state.lastRetrieval,
     lastRequest: state.lastRequest,
     lastResponse: state.lastResponse,
   });
+}
+
+function syncServerButtons(isRunning) {
+  if (state.serverAction === "starting") {
+    el.startServerBtn.hidden = false;
+    el.startServerBtn.disabled = true;
+    el.startServerBtn.textContent = "Starting server...";
+    el.stopServerBtn.hidden = true;
+    return;
+  }
+
+  if (state.serverAction === "stopping") {
+    el.stopServerBtn.hidden = false;
+    el.stopServerBtn.disabled = true;
+    el.stopServerBtn.textContent = "Stopping server...";
+    el.startServerBtn.hidden = true;
+    return;
+  }
+
+  el.startServerBtn.textContent = "Start Server";
+  el.stopServerBtn.textContent = "Stop Server";
+  el.startServerBtn.disabled = false;
+  el.stopServerBtn.disabled = false;
+  el.startServerBtn.hidden = !!isRunning;
+  el.stopServerBtn.hidden = !isRunning;
+}
+
+function setActiveTab(tabName) {
+  for (const button of el.tabButtons) {
+    button.classList.toggle("active", button.dataset.tab === tabName);
+  }
+  for (const panel of el.tabPanels) {
+    panel.classList.toggle("active", panel.dataset.panel === tabName);
+  }
 }
 
 function renderMessages() {
@@ -127,6 +174,9 @@ async function refreshHealth() {
     const health = await callJson("/api/health");
     const serverStatus = await callJson("/api/server/status");
     state.serverStatus = serverStatus;
+    if (!state.serverAction) {
+      syncServerButtons(!!serverStatus.running);
+    }
     el.healthBadge.textContent = "Web UI ready";
     el.healthBadge.className = "badge good";
     if (health.llama_running) {
@@ -137,6 +187,9 @@ async function refreshHealth() {
       el.llamaBadge.className = "badge bad";
     }
   } catch (err) {
+    if (!state.serverAction) {
+      syncServerButtons(false);
+    }
     el.healthBadge.textContent = "Web UI error";
     el.healthBadge.className = "badge bad";
     el.llamaBadge.textContent = String(err.message || err);
@@ -205,7 +258,8 @@ function parseSseBlock(block, assistantIndex) {
   if (eventName === "retrieval") {
     try {
       const payload = JSON.parse(dataText);
-      state.lastResponse = payload;
+      state.lastRetrieval = Array.isArray(payload?.retrieval) ? payload.retrieval : [];
+      state.lastResponse = { ...(state.lastResponse || {}), retrieval: state.lastRetrieval };
       updateInspector();
     } catch {
       // ignore parsing issue for retrieval side-channel
@@ -239,6 +293,118 @@ function parseSseBlock(block, assistantIndex) {
     state.lastResponse = { ...(state.lastResponse || {}), usage: parsed.usage };
     updateInspector();
   }
+}
+
+function looksLikeRagRefusal(text) {
+  const normalized = String(text || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return false;
+
+  const patterns = [
+    "can't access",
+    "cannot access",
+    "can't directly",
+    "cannot directly",
+    "unable to directly",
+    "can't retrieve",
+    "cannot retrieve",
+    "can't view",
+    "cannot view",
+    "can't analyze",
+    "cannot analyze",
+    "if you provide the text",
+  ];
+  const mentionsDoc = /file|files|document|documents|attachment|attached|scan|image|paper/.test(normalized);
+  return mentionsDoc && patterns.some((pattern) => normalized.includes(pattern));
+}
+
+function tokenizeForFallback(text) {
+  return String(text || "")
+    .toLowerCase()
+    .match(/[a-z0-9_]+/g) || [];
+}
+
+function buildExtractiveFallback(query, chunks) {
+  const stop = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could", "did", "do", "does",
+    "for", "from", "had", "has", "have", "he", "her", "his", "i", "if", "in", "is", "it", "its",
+    "me", "my", "of", "on", "or", "our", "please", "said", "she", "so", "that", "the", "their",
+    "them", "there", "they", "this", "to", "us", "was", "we", "were", "what", "when", "where",
+    "which", "who", "why", "with", "would", "you", "your",
+  ]);
+  const queryTokens = tokenizeForFallback(query).filter((token) => !stop.has(token));
+  const scored = [];
+
+  for (const chunk of chunks || []) {
+    const source = String(chunk?.source || "unknown-source");
+    const sentences = String(chunk?.text || "")
+      .split(/(?<=[.!?])\s+|\n+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const sentence of sentences) {
+      const words = new Set(tokenizeForFallback(sentence));
+      if (words.size === 0) continue;
+      let score = 0;
+      for (const token of queryTokens) {
+        if (words.has(token)) score += 1;
+      }
+      scored.push({ score, sentence, source });
+    }
+  }
+
+  let selected = [];
+  if (scored.length > 0) {
+    scored.sort((a, b) => b.score - a.score);
+    selected = scored.slice(0, 3);
+  }
+
+  if (selected.length === 0) {
+    const firstChunk = chunks?.[0];
+    if (!firstChunk) return "";
+    const src = String(firstChunk.source || "unknown-source");
+    const snippet = String(firstChunk.text || "").replace(/\s+/g, " ").slice(0, 600);
+    return `From the indexed document(s):\n- ${snippet} [${src}]`;
+  }
+
+  const lines = ["From the indexed document(s):"];
+  for (const item of selected) {
+    lines.push(`- ${item.sentence} [${item.source}]`);
+  }
+  return lines.join("\n");
+}
+
+async function applyFrontendRagFallback(assistantIndex, userQuery) {
+  if (!el.ragEnabled.checked) return;
+  const content = String(state.messages?.[assistantIndex]?.content || "");
+  if (!looksLikeRagRefusal(content)) return;
+
+  let chunks = Array.isArray(state.lastRetrieval) ? state.lastRetrieval : [];
+  if (chunks.length === 0) {
+    try {
+      const searchResult = await callJson("/api/rag/search", {
+        method: "POST",
+        body: JSON.stringify({
+          query: userQuery,
+          top_k: Number(el.ragTopKInput.value || 4),
+        }),
+      });
+      chunks = Array.isArray(searchResult?.results) ? searchResult.results : [];
+    } catch {
+      chunks = [];
+    }
+  }
+  if (chunks.length === 0) return;
+
+  const fallback = buildExtractiveFallback(userQuery, chunks);
+  if (!fallback) return;
+
+  state.lastRetrieval = chunks;
+  state.lastResponse = { ...(state.lastResponse || {}), frontend_rag_fallback: true, retrieval: chunks };
+  state.messages[assistantIndex].content = fallback;
+  renderMessages();
+  updateInspector();
 }
 
 async function sendMessage() {
@@ -293,6 +459,7 @@ async function sendMessage() {
     state.messages[assistantIndex].content += `\n\n[stream error] ${err.message || err}`;
     renderMessages();
   } finally {
+    await applyFrontendRagFallback(assistantIndex, text);
     state.streamAbort = null;
     el.sendBtn.disabled = false;
     el.stopBtn.disabled = true;
@@ -301,6 +468,9 @@ async function sendMessage() {
 }
 
 async function startServer() {
+  if (state.serverAction) return;
+  state.serverAction = "starting";
+  syncServerButtons(false);
   try {
     const payload = {
       model_path: el.modelPathInput.value.trim(),
@@ -320,18 +490,23 @@ async function startServer() {
   } catch (err) {
     alert(`Server start failed: ${err.message || err}`);
   } finally {
-    refreshHealth();
+    state.serverAction = null;
+    await refreshHealth();
   }
 }
 
 async function stopServer() {
+  if (state.serverAction) return;
+  state.serverAction = "stopping";
+  syncServerButtons(true);
   try {
     const result = await callJson("/api/server/stop", { method: "POST" });
     state.serverStatus = result;
   } catch (err) {
     alert(`Server stop failed: ${err.message || err}`);
   } finally {
-    refreshHealth();
+    state.serverAction = null;
+    await refreshHealth();
   }
 }
 
@@ -359,6 +534,80 @@ async function indexRag() {
     await refreshRag();
   } catch (err) {
     alert(`RAG indexing failed: ${err.message || err}`);
+  }
+}
+
+function mergeUniquePaths(existingText, newPaths) {
+  const merged = new Set(
+    existingText
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+  );
+  for (const path of newPaths) {
+    if (path && String(path).trim()) {
+      merged.add(String(path).trim());
+    }
+  }
+  return Array.from(merged).join("\n");
+}
+
+async function uploadRagFiles() {
+  const files = Array.from(el.ragUploadInput.files || []);
+  if (files.length === 0) {
+    alert("Select at least one file to upload.");
+    return;
+  }
+
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append("files", file);
+  }
+  formData.append("chunk_size", String(Number(el.chunkSizeInput.value || 220)));
+  formData.append("chunk_overlap", String(Number(el.chunkOverlapInput.value || 40)));
+  formData.append("reset", "false");
+
+  el.uploadRagBtn.disabled = true;
+  try {
+    const response = await fetch("/api/rag/upload", {
+      method: "POST",
+      body: formData,
+    });
+    const raw = await response.text();
+    let payload = {};
+    try {
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      payload = { raw };
+    }
+
+    if (!response.ok) {
+      const detail = payload?.detail || payload?.error || raw || `HTTP ${response.status}`;
+      throw new Error(typeof detail === "string" ? detail : pretty(detail));
+    }
+
+    const savedFiles = Array.isArray(payload.saved_files) ? payload.saved_files : [];
+    const skipped = Array.isArray(payload.skipped_files) ? payload.skipped_files : [];
+    el.ragPathsInput.value = mergeUniquePaths(el.ragPathsInput.value, savedFiles);
+    el.ragUploadInput.value = "";
+
+    state.lastResponse = payload;
+    await refreshRag();
+    const addedChunks = Number(payload.indexed?.added_chunks || 0);
+    const skippedSummary =
+      skipped.length > 0 ? ` Skipped: ${skipped.map((item) => `${item.file} (${item.reason})`).join(", ")}.` : "";
+    if (addedChunks <= 0) {
+      alert(
+        `Upload completed but no RAG chunks were indexed. Uploaded ${payload.saved_count || 0} file(s).${skippedSummary}`
+      );
+    } else {
+      alert(`Uploaded ${payload.saved_count || 0} file(s). Added ${addedChunks} chunk(s).${skippedSummary}`);
+    }
+  } catch (err) {
+    alert(`RAG upload failed: ${err.message || err}`);
+  } finally {
+    el.uploadRagBtn.disabled = false;
+    updateInspector();
   }
 }
 
@@ -396,6 +645,86 @@ async function startTraining() {
     await refreshTraining();
   } catch (err) {
     alert(`Training start failed: ${err.message || err}`);
+  }
+}
+
+async function uploadTrainingDataset() {
+  const file = el.trainUploadInput.files?.[0];
+  if (!file) {
+    alert("Select a dataset file first.");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  el.uploadTrainBtn.disabled = true;
+  try {
+    const response = await fetch("/api/train/upload-dataset", {
+      method: "POST",
+      body: formData,
+    });
+    const raw = await response.text();
+    let payload = {};
+    try {
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      payload = { raw };
+    }
+    if (!response.ok) {
+      const detail = payload?.detail || payload?.error || raw || `HTTP ${response.status}`;
+      throw new Error(typeof detail === "string" ? detail : pretty(detail));
+    }
+
+    el.trainDatasetInput.value = payload.dataset_path || "";
+    state.lastResponse = payload;
+    updateInspector();
+    alert(`Uploaded dataset: ${payload.filename}`);
+  } catch (err) {
+    alert(`Dataset upload failed: ${err.message || err}`);
+  } finally {
+    el.uploadTrainBtn.disabled = false;
+  }
+}
+
+async function createTrainingDatasetFromRaw() {
+  const rawText = el.trainRawDataInput.value || "";
+  if (!rawText.trim()) {
+    alert("Enter raw training data first.");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("raw_text", rawText);
+  formData.append("format", el.trainRawFormatInput.value || "lines");
+  formData.append("filename", (el.trainRawNameInput.value || "raw_dataset").trim());
+
+  el.createRawDatasetBtn.disabled = true;
+  try {
+    const response = await fetch("/api/train/raw-dataset", {
+      method: "POST",
+      body: formData,
+    });
+    const raw = await response.text();
+    let payload = {};
+    try {
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      payload = { raw };
+    }
+    if (!response.ok) {
+      const detail = payload?.detail || payload?.error || raw || `HTTP ${response.status}`;
+      throw new Error(typeof detail === "string" ? detail : pretty(detail));
+    }
+
+    el.trainDatasetInput.value = payload.dataset_path || "";
+    state.lastResponse = payload;
+    updateInspector();
+    alert(`Prepared dataset: ${payload.filename} (${payload.rows || 0} rows)`);
+  } catch (err) {
+    alert(`Raw dataset prep failed: ${err.message || err}`);
+  } finally {
+    el.createRawDatasetBtn.disabled = false;
   }
 }
 
@@ -467,7 +796,10 @@ function setupEvents() {
   el.startServerBtn.addEventListener("click", startServer);
   el.stopServerBtn.addEventListener("click", stopServer);
   el.indexRagBtn.addEventListener("click", indexRag);
+  el.uploadRagBtn.addEventListener("click", uploadRagFiles);
   el.resetRagBtn.addEventListener("click", resetRag);
+  el.uploadTrainBtn.addEventListener("click", uploadTrainingDataset);
+  el.createRawDatasetBtn.addEventListener("click", createTrainingDatasetFromRaw);
   el.startTrainBtn.addEventListener("click", startTraining);
   el.stopTrainBtn.addEventListener("click", stopTraining);
   el.clearChatBtn.addEventListener("click", () => {
@@ -485,10 +817,14 @@ function setupEvents() {
       el.userInput.focus();
     });
   });
+  for (const button of el.tabButtons) {
+    button.addEventListener("click", () => setActiveTab(button.dataset.tab));
+  }
 }
 
 async function boot() {
   setupEvents();
+  syncServerButtons(false);
   await refreshHealth();
   await refreshRag();
   await refreshTraining();
@@ -502,4 +838,3 @@ async function boot() {
 }
 
 boot();
-

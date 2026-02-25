@@ -13,6 +13,14 @@
         <span class="brand-kicker">BitNet</span>
         <h1>Command Deck</h1>
       </div>
+      <div class="top-actions">
+        <button id="clearChatBtn" class="btn subtle">Clear Chat</button>
+        <button id="saveSessionBtn" class="btn subtle">Save Session</button>
+        <label class="btn subtle file-btn">
+          Load Session
+          <input id="loadSessionInput" type="file" accept=".json" />
+        </label>
+      </div>
       <div class="statusline">
         <span id="healthBadge" class="badge muted">Checking...</span>
         <span id="llamaBadge" class="badge muted">Server unknown</span>
@@ -21,22 +29,9 @@
 
     <main class="layout">
       <section class="chat-panel panel">
-        <div class="panel-head">
-          <h2>Chat + RAG</h2>
-          <div class="chat-actions">
-            <button id="clearChatBtn" class="btn subtle">Clear</button>
-            <button id="saveSessionBtn" class="btn subtle">Save</button>
-            <label class="btn subtle file-btn">
-              Load
-              <input id="loadSessionInput" type="file" accept=".json" />
-            </label>
-          </div>
-        </div>
-
         <div id="chatFeed" class="chat-feed"></div>
 
         <div class="composer">
-          <textarea id="systemPromptInput" rows="2" placeholder="System prompt (optional)"></textarea>
           <textarea id="userInput" rows="3" placeholder="Ask something..."></textarea>
           <div class="composer-row">
             <label class="check-wrap">
@@ -56,8 +51,16 @@
         </div>
       </section>
 
-      <aside class="sidebar">
-        <section class="panel">
+      <aside class="sidebar panel">
+        <nav class="tab-nav">
+          <button class="tab-btn active" data-tab="runtime">Runtime</button>
+          <button class="tab-btn" data-tab="generation">Generation</button>
+          <button class="tab-btn" data-tab="rag">RAG</button>
+          <button class="tab-btn" data-tab="training">Training</button>
+          <button class="tab-btn" data-tab="inspector">Inspector</button>
+        </nav>
+
+        <section class="tab-panel active" data-panel="runtime">
           <h3>Runtime</h3>
           <label>Model path</label>
           <input id="modelPathInput" type="text" value="models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf" />
@@ -85,8 +88,10 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="tab-panel" data-panel="generation">
           <h3>Generation</h3>
+          <label>System prompt</label>
+          <textarea id="systemPromptInput" rows="3" placeholder="Optional high-level instructions for the assistant"></textarea>
           <div class="inline-grid">
             <div>
               <label>Temperature</label>
@@ -115,8 +120,14 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="tab-panel" data-panel="rag">
           <h3>RAG Index</h3>
+          <label>Upload Files</label>
+          <p class="small-note">Supported: .txt, .md, .rst, .py, .json, .jsonl, .yaml, .yml, .csv, .log, .docx</p>
+          <input id="ragUploadInput" type="file" multiple />
+          <div class="button-row">
+            <button id="uploadRagBtn" class="btn accent">Upload + Index</button>
+          </div>
           <label>Paths (one per line)</label>
           <textarea id="ragPathsInput" rows="4" placeholder="E:\vsprojects\BitNet\docs&#10;E:\notes\project.md"></textarea>
           <div class="inline-grid">
@@ -136,13 +147,36 @@
           <pre id="ragStatus" class="code-box"></pre>
         </section>
 
-        <section class="panel">
+        <section class="tab-panel" data-panel="training">
           <h3>Training</h3>
           <p class="small-note">
             This launches LoRA fine-tuning jobs for Hugging Face models (not direct in-place BitNet GGUF weight training).
           </p>
           <label>Base model (HF id or local)</label>
           <input id="trainBaseModelInput" type="text" value="meta-llama/Llama-3.2-1B-Instruct" />
+          <label>Upload dataset file (JSON/JSONL/CSV)</label>
+          <input id="trainUploadInput" type="file" accept=".json,.jsonl,.csv" />
+          <div class="button-row">
+            <button id="uploadTrainBtn" class="btn subtle">Upload Dataset</button>
+          </div>
+          <label>Raw data text</label>
+          <textarea id="trainRawDataInput" rows="5" placeholder="Plain lines: one training sample per line&#10;or JSONL: one JSON object per line"></textarea>
+          <div class="inline-grid">
+            <div>
+              <label>Raw format</label>
+              <select id="trainRawFormatInput">
+                <option value="lines">Plain text lines</option>
+                <option value="jsonl">JSONL objects</option>
+              </select>
+            </div>
+            <div>
+              <label>Dataset name</label>
+              <input id="trainRawNameInput" type="text" value="raw_dataset" />
+            </div>
+          </div>
+          <div class="button-row">
+            <button id="createRawDatasetBtn" class="btn subtle">Use Raw Data</button>
+          </div>
           <label>Dataset path (JSON/JSONL/CSV)</label>
           <input id="trainDatasetInput" type="text" placeholder="E:\datasets\train.jsonl" />
           <label>Output directory</label>
@@ -180,7 +214,7 @@
           <pre id="trainStatus" class="code-box"></pre>
         </section>
 
-        <section class="panel">
+        <section class="tab-panel" data-panel="inspector">
           <h3>Inspector</h3>
           <pre id="inspector" class="code-box"></pre>
         </section>
@@ -197,4 +231,3 @@
     <script src="/static/app.js"></script>
   </body>
 </html>
-

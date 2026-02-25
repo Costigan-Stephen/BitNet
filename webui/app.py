@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -11,12 +14,12 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -28,7 +31,100 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 WEBUI_DIR = Path(__file__).resolve().parent
 STATIC_DIR = WEBUI_DIR / "static"
 DATA_DIR = WEBUI_DIR / "data"
+UPLOADS_DIR = DATA_DIR / "uploads"
+TRAIN_DATASETS_DIR = DATA_DIR / "train_datasets"
 RAG_DB_PATH = DATA_DIR / "rag_index.json"
+LOGGER = logging.getLogger("bitnet.webui")
+RAG_UPLOAD_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".rst",
+    ".py",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".log",
+    ".docx",
+}
+RAG_REFUSAL_PATTERNS = [
+    "i can't directly",
+    "i cannot directly",
+    "unable to directly access",
+    "can't access files",
+    "cannot access files",
+    "can't directly access",
+    "cannot directly access",
+    "can't view",
+    "cannot view",
+    "can't analyze files",
+    "cannot analyze files",
+    "can't read files",
+    "cannot read files",
+]
+RAG_EXTRACTIVE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "his",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "please",
+    "said",
+    "she",
+    "so",
+    "that",
+    "the",
+    "their",
+    "them",
+    "there",
+    "they",
+    "this",
+    "to",
+    "us",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "would",
+    "you",
+    "your",
+}
 
 
 def _creation_flags() -> int:
@@ -39,11 +135,11 @@ def _creation_flags() -> int:
 
 class ProcessState:
     def __init__(self) -> None:
-        self.process: subprocess.Popen[str] | None = None
-        self.started_at: float | None = None
+        self.process: Optional[subprocess.Popen] = None
+        self.started_at: Optional[float] = None
         self.command: list[str] = []
         self.logs: deque[str] = deque(maxlen=1200)
-        self.last_error: str | None = None
+        self.last_error: Optional[str] = None
         self.lock = threading.RLock()
 
     def is_running(self) -> bool:
@@ -65,7 +161,7 @@ class LlamaServerManager:
         self.state = ProcessState()
         self.host = "127.0.0.1"
         self.port = 8080
-        self.model_path: str | None = None
+        self.model_path: Optional[str] = None
         self.extra: dict[str, Any] = {}
 
     @property
@@ -258,7 +354,7 @@ class TrainingManager:
     def __init__(self) -> None:
         self.state = ProcessState()
         self.job_config: dict[str, Any] = {}
-        self.exit_code: int | None = None
+        self.exit_code: Optional[int] = None
         self.status_value = "idle"
 
     def _drain_pipe(self, pipe: Any, stream_name: str) -> None:
@@ -366,7 +462,7 @@ class ChatRequest(BaseModel):
     repeat_penalty: float = 1.05
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
-    seed: int | None = None
+    seed: Optional[int] = None
     stop: list[str] = Field(default_factory=list)
     rag_enabled: bool = False
     rag_top_k: int = 4
@@ -385,9 +481,9 @@ class RagSearchRequest(BaseModel):
 
 
 class TrainStartRequest(BaseModel):
-    command: list[str] | None = None
-    base_model: str | None = None
-    dataset_path: str | None = None
+    command: Optional[list[str]] = None
+    base_model: Optional[str] = None
+    dataset_path: Optional[str] = None
     output_dir: str = "training-output/adapter"
     epochs: int = 1
     batch_size: int = 1
@@ -415,7 +511,60 @@ def _ensure_server_running() -> None:
         raise HTTPException(status_code=503, detail="llama-server is not running.")
 
 
-async def _upstream_request(method: str, path: str, body: dict[str, Any] | list[Any] | None = None) -> Any:
+def _pick_default_model() -> Optional[Path]:
+    env_model = os.getenv("BITNET_DEFAULT_MODEL", "").strip()
+    if env_model:
+        candidate = Path(env_model).expanduser().resolve()
+        if candidate.exists():
+            return candidate
+
+    preferred = ROOT_DIR / "models" / "BitNet-b1.58-2B-4T" / "ggml-model-i2_s.gguf"
+    if preferred.exists():
+        return preferred
+
+    models_root = ROOT_DIR / "models"
+    if not models_root.exists():
+        return None
+
+    for candidate in sorted(models_root.rglob("*.gguf")):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _sanitize_upload_name(filename: str) -> str:
+    raw_name = Path(filename or "").name.strip()
+    sanitized = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw_name).strip("._")
+    if not sanitized:
+        sanitized = f"upload_{int(time.time() * 1000)}.txt"
+    if len(sanitized) > 180:
+        stem = Path(sanitized).stem[:160]
+        suffix = Path(sanitized).suffix[:20]
+        sanitized = f"{stem}{suffix}"
+    return sanitized
+
+
+def _unique_upload_path(filename: str) -> Path:
+    return _unique_path_in_dir(UPLOADS_DIR, filename)
+
+
+def _unique_path_in_dir(base_dir: Path, filename: str) -> Path:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    candidate = base_dir / filename
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 1
+    while candidate.exists():
+        candidate = base_dir / f"{stem}_{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+async def _upstream_request(
+    method: str,
+    path: str,
+    body: Optional[Union[dict[str, Any], list[Any]]] = None,
+) -> Any:
     _ensure_server_running()
     url = f"{llama_server.base_url}{path}"
     async with httpx.AsyncClient(timeout=300) as client:
@@ -431,12 +580,81 @@ async def _upstream_request(method: str, path: str, body: dict[str, Any] | list[
         return {"raw": response.text}
 
 
+async def _upstream_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
+    request_payload = dict(payload)
+    request_payload["stream"] = False
+    try:
+        response = await _upstream_request("POST", "/v1/chat/completions", request_payload)
+        if isinstance(response, dict):
+            return response
+    except HTTPException:
+        pass
+
+    # Some local llama-server builds are unstable on non-stream responses.
+    # Fall back to streaming and reconstruct a completion payload.
+    _ensure_server_running()
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+    url = f"{llama_server.base_url}/v1/chat/completions"
+    full_text = ""
+    usage: Optional[dict[str, Any]] = None
+    finish_reason = "stop"
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        try:
+            async with client.stream("POST", url, json=stream_payload) as response:
+                if response.status_code >= 400:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")
+                    raise HTTPException(status_code=response.status_code, detail=detail)
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        payload_piece = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (payload_piece.get("choices") or [{}])[0]
+                    delta = (choice.get("delta") or {}).get("content", "")
+                    if delta:
+                        full_text += str(delta)
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice.get("finish_reason"))
+                    if payload_piece.get("usage") is not None:
+                        usage = payload_piece.get("usage")
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    rebuilt: dict[str, Any] = {
+        "id": "bitnet-upstream-stream-collected",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": full_text},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    if usage is not None:
+        rebuilt["usage"] = usage
+    return rebuilt
+
+
 def _build_chat_payload(req: ChatRequest) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     messages: list[dict[str, str]] = []
     retrieval_chunks: list[dict[str, Any]] = []
 
-    if req.rag_enabled and req.messages:
-        query = req.messages[-1].content
+    query = req.messages[-1].content if req.messages else ""
+    should_use_rag = bool(req.rag_enabled)
+    if not should_use_rag and query:
+        if _query_mentions_document(query):
+            should_use_rag = rag_store.status().get("total_chunks", 0) > 0
+
+    if should_use_rag and query:
+        _ensure_rag_index_ready()
         retrieval_chunks = rag_store.search(query, top_k=max(1, req.rag_top_k))
 
     system_parts: list[str] = []
@@ -445,11 +663,15 @@ def _build_chat_payload(req: ChatRequest) -> tuple[dict[str, Any], list[dict[str
 
     if retrieval_chunks:
         context_lines = [
-            "Use the retrieved context below when it is relevant. Cite source file paths in your answer when possible."
+            "You are given retrieved snippets from local indexed files for this request.",
+            "Do not claim you cannot access files or documents when snippets are provided here.",
+            "Answer using the snippets when relevant and cite source file paths in square brackets.",
+            "If the snippets do not contain the requested detail, clearly state what is missing.",
         ]
         for idx, chunk in enumerate(retrieval_chunks, start=1):
-            context_lines.append(f"[{idx}] {chunk['source']}")
-            context_lines.append(chunk["text"])
+            context_lines.append(f"--- BEGIN RETRIEVED CHUNK {idx} | SOURCE: {chunk['source']} ---")
+            context_lines.append(_compact_retrieval_text(str(chunk.get("text", ""))))
+            context_lines.append(f"--- END RETRIEVED CHUNK {idx} ---")
         system_parts.append("\n".join(context_lines))
 
     if system_parts:
@@ -474,6 +696,172 @@ def _build_chat_payload(req: ChatRequest) -> tuple[dict[str, Any], list[dict[str
     if req.seed is not None:
         payload["seed"] = req.seed
     return payload, retrieval_chunks
+
+
+def _extract_assistant_text(response_payload: dict[str, Any]) -> str:
+    try:
+        return str(response_payload["choices"][0]["message"]["content"] or "")
+    except Exception:
+        return ""
+
+
+def _query_mentions_document(query: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(query or "").lower()).strip()
+    if not normalized:
+        return False
+    keywords = ("attach", "file", "document", "doc", "pdf", "scan", "uploaded", "rag", "index")
+    return any(word in normalized for word in keywords)
+
+
+def _compact_retrieval_text(text: str, max_chars: int = 480) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3].rstrip() + "..."
+
+
+def _ensure_rag_index_ready() -> None:
+    status = rag_store.status()
+    if status.get("total_chunks", 0) > 0:
+        return
+    if not UPLOADS_DIR.exists():
+        return
+    try:
+        rag_store.index_paths([str(UPLOADS_DIR)], chunk_size=220, chunk_overlap=40, reset=False)
+    except Exception as exc:
+        LOGGER.warning("RAG auto-index skipped due to error: %s", exc)
+
+
+def _looks_like_rag_refusal(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    if not normalized:
+        return False
+    if any(pattern in normalized for pattern in RAG_REFUSAL_PATTERNS):
+        return True
+
+    refusal_regexes = [
+        r"\b(?:i\s*(?:am|'m)?\s*sorry[, ]*)?(?:but\s*)?(?:i\s+)?(?:can't|cannot|can not|unable to|do not|don't)\b.{0,90}\b(access|open|view|read|retrieve|analy[sz]e)\b.{0,90}\b(file|files|document|documents|attachment|attached|image|paper|scan)\b",
+        r"\b(file|files|document|documents|attachment|attached|image|paper|scan)\b.{0,90}\b(?:can't|cannot|can not|unable to|do not|don't)\b.{0,90}\b(access|open|view|read|retrieve|analy[sz]e)\b",
+        r"\bif you (?:can|could|would)?\s*provide\b.{0,120}\b(text|quote|content|details|main points)\b",
+    ]
+    return any(re.search(pattern, normalized) is not None for pattern in refusal_regexes)
+
+
+def _build_rag_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    retry_payload = dict(payload)
+    retry_payload["messages"] = list(payload.get("messages", []))
+    retry_instruction = {
+        "role": "system",
+        "content": (
+            "CRITICAL: Retrieved chunks from local files are included in this conversation. "
+            "Do not say you cannot access files/documents. "
+            "Answer using the retrieved chunks and cite sources in square brackets."
+        ),
+    }
+    retry_payload["messages"].insert(0, retry_instruction)
+    return retry_payload
+
+
+def _build_forced_rag_fallback_response(retrieval_chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    if not retrieval_chunks:
+        content = "No retrieved chunks were available to ground the answer."
+    else:
+        lines = ["I found relevant content in the indexed files:"]
+        for idx, chunk in enumerate(retrieval_chunks[:3], start=1):
+            source = chunk.get("source", "unknown-source")
+            excerpt = str(chunk.get("text", "")).strip().replace("\r", " ").replace("\n", " ")
+            excerpt = re.sub(r"\s+", " ", excerpt)[:500]
+            lines.append(f"{idx}. [{source}] {excerpt}")
+        lines.append("Ask a more specific question and I can extract exact points from these passages.")
+        content = "\n".join(lines)
+
+    return {
+        "id": "bitnet-rag-fallback",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def _extract_latest_user_query(payload: dict[str, Any]) -> str:
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        return ""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return str(msg.get("content", ""))
+    return ""
+
+
+def _tokenize_for_extractive(text: str) -> list[str]:
+    return re.findall(r"[a-zA-Z0-9_]+", text.lower())
+
+
+def _split_sentences(text: str) -> list[str]:
+    rough = re.split(r"(?<=[.!?])\s+|\n+", text)
+    sentences = [item.strip() for item in rough if item and item.strip()]
+    return sentences
+
+
+def _build_extractive_rag_response(query: str, retrieval_chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    query_tokens = [tok for tok in _tokenize_for_extractive(query) if tok not in RAG_EXTRACTIVE_STOPWORDS]
+    ranked: list[tuple[int, str, str]] = []
+
+    for chunk in retrieval_chunks[:5]:
+        source = str(chunk.get("source", "unknown-source"))
+        text = str(chunk.get("text", ""))
+        for sentence in _split_sentences(text):
+            sentence_tokens = set(_tokenize_for_extractive(sentence))
+            if not sentence_tokens:
+                continue
+            score = sum(1 for tok in query_tokens if tok in sentence_tokens)
+            ranked.append((score, sentence, source))
+
+    if ranked:
+        ranked.sort(key=lambda row: row[0], reverse=True)
+        top = ranked[:3]
+        lines = ["From the indexed document(s):"]
+        for _, sentence, source in top:
+            lines.append(f"- {sentence} [{source}]")
+        content = "\n".join(lines)
+    else:
+        content = _build_forced_rag_fallback_response(retrieval_chunks)["choices"][0]["message"]["content"]
+
+    return {
+        "id": "bitnet-rag-extractive",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+async def _chat_with_rag_retry(
+    payload: dict[str, Any],
+    retrieval_chunks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    query = _extract_latest_user_query(payload)
+    if retrieval_chunks and _query_mentions_document(query):
+        return _build_extractive_rag_response(query, retrieval_chunks)
+
+    response = await _upstream_chat_completion(payload)
+    content = _extract_assistant_text(response)
+    if retrieval_chunks and _looks_like_rag_refusal(content):
+        retry_payload = _build_rag_retry_payload(payload)
+        response = await _upstream_chat_completion(retry_payload)
+        content = _extract_assistant_text(response)
+        if _looks_like_rag_refusal(content):
+            response = _build_extractive_rag_response(query, retrieval_chunks)
+    return response
 
 
 def _default_train_command(req: TrainStartRequest) -> list[str]:
@@ -577,14 +965,15 @@ async def server_stop() -> JSONResponse:
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> JSONResponse:
     payload, retrieval_chunks = _build_chat_payload(req)
-    response = await _upstream_request("POST", "/v1/chat/completions", payload)
+    response = await _chat_with_rag_retry(payload, retrieval_chunks)
+    if retrieval_chunks and _looks_like_rag_refusal(_extract_assistant_text(response)):
+        response = _build_forced_rag_fallback_response(retrieval_chunks)
     return JSONResponse({"retrieval": retrieval_chunks, "response": response})
 
 
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     payload, retrieval_chunks = _build_chat_payload(req)
-    payload["stream"] = True
     _ensure_server_running()
 
     async def event_stream() -> Any:
@@ -592,10 +981,38 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             data = json.dumps({"retrieval": retrieval_chunks}, ensure_ascii=True)
             yield f"event: retrieval\ndata: {data}\n\n"
 
+        # For RAG requests we run a guarded non-stream call so we can auto-retry
+        # refusal-style answers and return grounded content reliably.
+        if retrieval_chunks:
+            try:
+                response = await _chat_with_rag_retry(payload, retrieval_chunks)
+                content = _extract_assistant_text(response)
+                if _looks_like_rag_refusal(content):
+                    response = _build_forced_rag_fallback_response(retrieval_chunks)
+                    content = _extract_assistant_text(response)
+                chunk_payload = {
+                    "id": "bitnet-rag-stream",
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                    ],
+                }
+                usage = response.get("usage")
+                if usage is not None:
+                    chunk_payload["usage"] = usage
+                yield f"data: {json.dumps(chunk_payload, ensure_ascii=True)}\n\n"
+                yield "data: [DONE]\n\n"
+            except HTTPException as exc:
+                error_data = json.dumps({"error": str(exc.detail or exc)}, ensure_ascii=True)
+                yield f"event: error\ndata: {error_data}\n\n"
+            return
+
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
         url = f"{llama_server.base_url}/v1/chat/completions"
         async with httpx.AsyncClient(timeout=None) as client:
             try:
-                async with client.stream("POST", url, json=payload) as response:
+                async with client.stream("POST", url, json=stream_payload) as response:
                     if response.status_code >= 400:
                         details = await response.aread()
                         error_data = json.dumps({"error": details.decode("utf-8", errors="replace")}, ensure_ascii=True)
@@ -630,6 +1047,70 @@ async def rag_index(req: RagIndexRequest) -> JSONResponse:
         req.reset,
     )
     return JSONResponse(result)
+
+
+@app.post("/api/rag/upload")
+async def rag_upload(
+    files: list[UploadFile] = File(...),
+    chunk_size: int = Form(220),
+    chunk_overlap: int = Form(40),
+    reset: bool = Form(False),
+) -> JSONResponse:
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+
+    saved_paths: list[str] = []
+    skipped_files: list[dict[str, str]] = []
+
+    for upload in files:
+        original_name = upload.filename or ""
+        suffix = Path(original_name).suffix.lower()
+        if suffix not in RAG_UPLOAD_EXTENSIONS:
+            skipped_files.append(
+                {
+                    "file": original_name or "unnamed",
+                    "reason": f"unsupported extension '{suffix or '(none)'}'",
+                }
+            )
+            await upload.close()
+            continue
+        target_path = _unique_upload_path(_sanitize_upload_name(original_name))
+        try:
+            data = await upload.read()
+            if not data:
+                skipped_files.append({"file": original_name or target_path.name, "reason": "empty file"})
+                continue
+            target_path.write_bytes(data)
+            saved_paths.append(str(target_path))
+        except Exception as exc:
+            skipped_files.append({"file": original_name or target_path.name, "reason": str(exc)})
+        finally:
+            await upload.close()
+
+    if not saved_paths:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "No valid files uploaded.",
+                "skipped_files": skipped_files,
+            },
+        )
+
+    index_result = await asyncio.to_thread(
+        rag_store.index_paths,
+        saved_paths,
+        chunk_size,
+        chunk_overlap,
+        reset,
+    )
+    return JSONResponse(
+        {
+            "saved_files": saved_paths,
+            "saved_count": len(saved_paths),
+            "skipped_files": skipped_files,
+            "indexed": index_result,
+        }
+    )
 
 
 @app.post("/api/rag/search")
@@ -681,6 +1162,83 @@ async def train_template() -> JSONResponse:
     )
 
 
+@app.post("/api/train/upload-dataset")
+async def train_upload_dataset(file: UploadFile = File(...)) -> JSONResponse:
+    filename = _sanitize_upload_name(file.filename or "dataset.jsonl")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".json", ".jsonl", ".csv"}:
+        raise HTTPException(status_code=400, detail="Unsupported dataset format. Use JSON, JSONL, or CSV.")
+
+    target_path = _unique_path_in_dir(TRAIN_DATASETS_DIR, filename)
+    try:
+        payload = await file.read()
+    finally:
+        await file.close()
+
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded dataset is empty.")
+
+    target_path.write_bytes(payload)
+    return JSONResponse(
+        {
+            "dataset_path": str(target_path),
+            "filename": target_path.name,
+            "size_bytes": len(payload),
+        }
+    )
+
+
+@app.post("/api/train/raw-dataset")
+async def train_raw_dataset(
+    raw_text: str = Form(...),
+    format: str = Form("lines"),
+    filename: str = Form("raw_dataset"),
+) -> JSONResponse:
+    text = raw_text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Raw dataset text is empty.")
+
+    mode = (format or "lines").strip().lower()
+    output_lines: list[str] = []
+
+    if mode == "lines":
+        for line in raw_text.splitlines():
+            row = line.strip()
+            if not row:
+                continue
+            output_lines.append(json.dumps({"text": row}, ensure_ascii=False))
+    elif mode == "jsonl":
+        for idx, line in enumerate(raw_text.splitlines(), start=1):
+            row = line.strip()
+            if not row:
+                continue
+            try:
+                parsed = json.loads(row)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid JSONL on line {idx}: {exc.msg}") from exc
+            if not isinstance(parsed, dict):
+                raise HTTPException(status_code=400, detail=f"JSONL line {idx} must be a JSON object.")
+            output_lines.append(json.dumps(parsed, ensure_ascii=False))
+    else:
+        raise HTTPException(status_code=400, detail="Invalid format. Use 'lines' or 'jsonl'.")
+
+    if not output_lines:
+        raise HTTPException(status_code=400, detail="No valid training rows found in raw text.")
+
+    safe_name = _sanitize_upload_name(filename)
+    stem = Path(safe_name).stem or "raw_dataset"
+    target_path = _unique_path_in_dir(TRAIN_DATASETS_DIR, f"{stem}.jsonl")
+    target_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+    return JSONResponse(
+        {
+            "dataset_path": str(target_path),
+            "filename": target_path.name,
+            "format": mode,
+            "rows": len(output_lines),
+        }
+    )
+
+
 @app.post("/api/train/start")
 async def train_start(req: TrainStartRequest) -> JSONResponse:
     command = req.command if req.command else _default_train_command(req)
@@ -709,6 +1267,62 @@ async def lora_apply(req: LoraApplyRequest) -> JSONResponse:
     return JSONResponse(response)
 
 
+@app.on_event("startup")
+async def startup() -> None:
+    auto_start_value = os.getenv("BITNET_WEBUI_AUTO_START", "1").strip().lower()
+    auto_start = auto_start_value not in {"0", "false", "no", "off"}
+    if not auto_start:
+        LOGGER.info("BITNET_WEBUI_AUTO_START disabled; not auto-starting llama-server.")
+        return
+
+    if llama_server.status()["running"]:
+        return
+
+    model = _pick_default_model()
+    if model is None:
+        message = (
+            "Auto-start skipped: no GGUF model found. Set BITNET_DEFAULT_MODEL or place a model in ./models."
+        )
+        llama_server.state.last_error = message
+        LOGGER.warning(message)
+        return
+
+    host = os.getenv("BITNET_SERVER_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int(os.getenv("BITNET_SERVER_PORT", "8080"))
+        ctx_size = int(os.getenv("BITNET_SERVER_CTX", "2048"))
+        threads = int(os.getenv("BITNET_SERVER_THREADS", str(max(2, (os.cpu_count() or 4) // 2))))
+        n_predict = int(os.getenv("BITNET_SERVER_N_PREDICT", "4096"))
+    except ValueError as exc:
+        llama_server.state.last_error = f"Invalid BITNET_SERVER_* env value: {exc}"
+        LOGGER.warning(llama_server.state.last_error)
+        return
+
+    lora_raw = os.getenv("BITNET_SERVER_LORAS", "").strip()
+    lora_paths = [item.strip() for item in lora_raw.replace(";", ",").split(",") if item.strip()]
+
+    extra_args_raw = os.getenv("BITNET_SERVER_EXTRA_ARGS", "").strip()
+    extra_args = shlex.split(extra_args_raw) if extra_args_raw else []
+
+    try:
+        await asyncio.to_thread(
+            llama_server.start,
+            str(model),
+            host,
+            port,
+            ctx_size,
+            threads,
+            n_predict,
+            lora_paths,
+            extra_args,
+        )
+        LOGGER.info("Auto-started llama-server on %s:%s with model %s", host, port, model)
+    except Exception as exc:
+        message = f"Auto-start failed: {exc}"
+        llama_server.state.last_error = message
+        LOGGER.warning(message)
+
+
 @app.on_event("shutdown")
 def shutdown() -> None:
     if llama_server.status()["running"]:
@@ -718,4 +1332,3 @@ def shutdown() -> None:
 
     if os.name != "nt":
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-

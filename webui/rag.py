@@ -5,12 +5,42 @@ import math
 import re
 import threading
 import time
+import zipfile
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
-_SUPPORTED_EXTENSIONS = {".txt", ".md", ".rst", ".py", ".json", ".jsonl", ".yaml", ".yml", ".csv", ".log"}
+_SUPPORTED_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".rst",
+    ".py",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".log",
+    ".docx",
+}
+
+
+def _read_docx_text(path: Path) -> str:
+    with zipfile.ZipFile(path) as archive:
+        xml_blob = archive.read("word/document.xml")
+    root = ElementTree.fromstring(xml_blob)
+    texts = [node.text for node in root.iter() if node.tag.endswith("}t") and node.text]
+    return " ".join(texts)
+
+
+def _read_supported_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".docx":
+        return _read_docx_text(path)
+    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def _tokenize(text: str) -> list[str]:
@@ -99,17 +129,26 @@ class RagStore:
         with self._lock:
             if reset:
                 self._chunks = []
+            elif self._chunks:
+                # Remove duplicate chunk text accumulated from repeated uploads.
+                seen_texts: set[str] = set()
+                deduped_chunks: list[dict[str, Any]] = []
+                for item in self._chunks:
+                    text_key = str(item.get("text", ""))
+                    if not text_key or text_key in seen_texts:
+                        continue
+                    seen_texts.add(text_key)
+                    deduped_chunks.append(item)
+                self._chunks = deduped_chunks
             added_files = 0
             added_chunks = 0
 
-            existing_ids = {item["id"] for item in self._chunks}
-            chunk_seed = len(self._chunks)
-
+            existing_keys = {str(item.get("text", "")) for item in self._chunks}
             for raw_path in paths:
                 path = Path(raw_path).expanduser().resolve()
                 for file_path in self._iter_supported_files(path):
                     try:
-                        text = file_path.read_text(encoding="utf-8", errors="ignore")
+                        text = _read_supported_text(file_path)
                     except Exception:
                         continue
                     if not text.strip():
@@ -119,14 +158,17 @@ class RagStore:
                         tokens = _tokenize(chunk)
                         if not tokens:
                             continue
-                        chunk_id = f"{file_path}:{i}:{chunk_seed}"
-                        chunk_seed += 1
-                        if chunk_id in existing_ids:
+                        source = str(file_path)
+                        dedupe_key = chunk
+                        if dedupe_key in existing_keys:
                             continue
+                        chunk_hash = sha1(chunk.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                        chunk_id = f"{source}:{i}:{chunk_hash}"
+                        existing_keys.add(dedupe_key)
                         self._chunks.append(
                             {
                                 "id": chunk_id,
-                                "source": str(file_path),
+                                "source": source,
                                 "text": chunk,
                                 "tokens": tokens,
                                 "length": len(tokens),
@@ -161,6 +203,14 @@ class RagStore:
                 "updated_at": self._updated_at,
             }
 
+    def _to_result(self, score: float, chunk: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "score": round(score, 4),
+            "source": chunk["source"],
+            "text": chunk["text"][:1200],
+            "id": chunk["id"],
+        }
+
     def search(self, query: str, top_k: int = 4) -> list[dict[str, Any]]:
         with self._lock:
             if not self._chunks:
@@ -194,17 +244,12 @@ class RagStore:
                 if score > 0:
                     scores.append((score, chunk))
 
-            scores.sort(key=lambda pair: pair[0], reverse=True)
-            trimmed = scores[: max(1, top_k)]
-            results: list[dict[str, Any]] = []
-            for score, chunk in trimmed:
-                results.append(
-                    {
-                        "score": round(score, 4),
-                        "source": chunk["source"],
-                        "text": chunk["text"][:1200],
-                        "id": chunk["id"],
-                    }
-                )
-            return results
+            limit = max(1, top_k)
+            if scores:
+                scores.sort(key=lambda pair: pair[0], reverse=True)
+                return [self._to_result(score, chunk) for score, chunk in scores[:limit]]
 
+            # Fallback for low-overlap queries (e.g., "summarize the document"):
+            # return newest chunks so the model still gets document context.
+            fallback_chunks = self._chunks[-limit:]
+            return [self._to_result(0.0, chunk) for chunk in reversed(fallback_chunks)]
