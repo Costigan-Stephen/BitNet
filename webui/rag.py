@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 import zipfile
 from hashlib import sha1
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from xml.etree import ElementTree
 
 
@@ -24,7 +27,9 @@ _SUPPORTED_EXTENSIONS = {
     ".yml",
     ".csv",
     ".log",
+    ".doc",
     ".docx",
+    ".pdf",
 }
 
 
@@ -36,15 +41,116 @@ def _read_docx_text(path: Path) -> str:
     return " ".join(texts)
 
 
+def _extract_printable_strings(data: bytes, min_len: int = 24) -> str:
+    blob = data.decode("latin1", errors="ignore")
+    pattern = rf"[A-Za-z0-9][A-Za-z0-9 \t,.;:'\"!?()\[\]{{}}/\-]{{{max(1, min_len - 1)},}}"
+    chunks = re.findall(pattern, blob)
+    return "\n".join(chunks)
+
+
+def _read_doc_text(path: Path) -> str:
+    antiword = shutil.which("antiword")
+    if antiword:
+        try:
+            proc = subprocess.run(
+                [antiword, str(path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout
+        except Exception:
+            pass
+
+    if os.name == "nt":
+        try:
+            raw = str(path.resolve())
+            escaped = raw.replace("'", "''")
+            ps_script = (
+                "$ErrorActionPreference='Stop'; "
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+                "$word=New-Object -ComObject Word.Application; "
+                "$word.Visible=$false; $word.DisplayAlerts=0; "
+                f"$doc=$word.Documents.Open('{escaped}',$false,$true); "
+                "try { $doc.Content.Text } finally { $doc.Close($false); $word.Quit() }"
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=45,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout
+        except Exception:
+            pass
+
+    return _extract_printable_strings(path.read_bytes())
+
+
+def _read_pdf_text(path: Path) -> str:
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(str(path))
+        pages: list[str] = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            text = text.strip()
+            if text:
+                pages.append(text)
+        if pages:
+            return "\n\n".join(pages)
+    except Exception:
+        pass
+
+    pdftotext = shutil.which("pdftotext")
+    if pdftotext:
+        try:
+            proc = subprocess.run(
+                [pdftotext, "-layout", str(path), "-"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=45,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout
+        except Exception:
+            pass
+
+    return _extract_printable_strings(path.read_bytes(), min_len=32)
+
+
 def _read_supported_text(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".docx":
         return _read_docx_text(path)
+    if suffix == ".doc":
+        return _read_doc_text(path)
+    if suffix == ".pdf":
+        return _read_pdf_text(path)
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def _tokenize(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
+
+
+def _normalize_source_path(path_value: str) -> str:
+    try:
+        return str(Path(path_value).expanduser().resolve()).lower()
+    except Exception:
+        return str(Path(path_value)).lower()
 
 
 def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
@@ -140,27 +246,36 @@ class RagStore:
                     seen_texts.add(text_key)
                     deduped_chunks.append(item)
                 self._chunks = deduped_chunks
+            scanned_files = 0
             added_files = 0
             added_chunks = 0
+            skipped_files: list[dict[str, str]] = []
 
             existing_keys = {str(item.get("text", "")) for item in self._chunks}
             for raw_path in paths:
                 path = Path(raw_path).expanduser().resolve()
                 for file_path in self._iter_supported_files(path):
+                    scanned_files += 1
+                    source = str(file_path)
                     try:
                         text = _read_supported_text(file_path)
-                    except Exception:
+                    except Exception as exc:
+                        skipped_files.append({"file": source, "reason": f"read_error: {exc.__class__.__name__}"})
                         continue
                     if not text.strip():
+                        skipped_files.append({"file": source, "reason": "no_text_extracted"})
                         continue
-                    added_files += 1
+                    file_added_chunks = 0
+                    duplicate_chunks = 0
+                    dropped_empty_chunks = 0
                     for i, chunk in enumerate(_chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)):
                         tokens = _tokenize(chunk)
                         if not tokens:
+                            dropped_empty_chunks += 1
                             continue
-                        source = str(file_path)
                         dedupe_key = chunk
                         if dedupe_key in existing_keys:
+                            duplicate_chunks += 1
                             continue
                         chunk_hash = sha1(chunk.encode("utf-8", errors="ignore")).hexdigest()[:12]
                         chunk_id = f"{source}:{i}:{chunk_hash}"
@@ -174,14 +289,27 @@ class RagStore:
                                 "length": len(tokens),
                             }
                         )
+                        file_added_chunks += 1
                         added_chunks += 1
+                    if file_added_chunks > 0:
+                        added_files += 1
+                    else:
+                        if duplicate_chunks > 0:
+                            reason = "all_chunks_duplicate"
+                        elif dropped_empty_chunks > 0:
+                            reason = "no_tokenizable_chunks"
+                        else:
+                            reason = "no_chunks_created"
+                        skipped_files.append({"file": source, "reason": reason})
             self._rebuild_stats()
             self._save()
             return {
+                "scanned_files": scanned_files,
                 "added_files": added_files,
                 "added_chunks": added_chunks,
                 "total_chunks": len(self._chunks),
                 "updated_at": self._updated_at,
+                "skipped_files": skipped_files,
             }
 
     def clear(self) -> dict[str, Any]:
@@ -203,6 +331,102 @@ class RagStore:
                 "updated_at": self._updated_at,
             }
 
+    def source_chunk_counts(self) -> dict[str, int]:
+        with self._lock:
+            counts: dict[str, int] = {}
+            for item in self._chunks:
+                source = str(item.get("source", ""))
+                if not source:
+                    continue
+                counts[source] = counts.get(source, 0) + 1
+            return counts
+
+    def chunks_for_source(self, source: str, limit: int = 6) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [item for item in self._chunks if str(item.get("source", "")).lower() == source.lower()]
+            rows.sort(key=lambda item: str(item.get("id", "")))
+            trimmed = rows[: max(1, limit)]
+            return [
+                {
+                    "id": str(item.get("id", "")),
+                    "length": int(item.get("length", 0)),
+                    "preview": str(item.get("text", ""))[:420],
+                }
+                for item in trimmed
+            ]
+
+    def chunk_texts_for_source(self, source: str) -> list[str]:
+        with self._lock:
+            rows = [item for item in self._chunks if str(item.get("source", "")).lower() == source.lower()]
+            rows.sort(key=lambda item: str(item.get("id", "")))
+            return [str(item.get("text", "")) for item in rows if str(item.get("text", "")).strip()]
+
+    def extract_chunks_from_file(
+        self,
+        source_path: str,
+        chunk_size: int = 220,
+        chunk_overlap: int = 40,
+    ) -> list[str]:
+        path = Path(source_path).expanduser().resolve()
+        if not path.exists():
+            return []
+        if path.suffix.lower() not in _SUPPORTED_EXTENSIONS:
+            return []
+        try:
+            text = _read_supported_text(path)
+        except Exception:
+            return []
+        if not text.strip():
+            return []
+        return _chunk_text(text, chunk_size=max(1, int(chunk_size)), chunk_overlap=max(0, int(chunk_overlap)))
+
+    def remove_sources(self, sources: list[str]) -> dict[str, Any]:
+        with self._lock:
+            requested = [str(item).strip() for item in sources if str(item).strip()]
+            if not requested:
+                return {
+                    "requested_sources": [],
+                    "removed_sources": [],
+                    "missing_sources": [],
+                    "removed_chunks": 0,
+                    "total_chunks": len(self._chunks),
+                    "updated_at": self._updated_at,
+                }
+
+            normalized_targets = {item.lower() for item in requested}
+            before_counts: dict[str, int] = {}
+            for row in self._chunks:
+                source = str(row.get("source", ""))
+                if not source:
+                    continue
+                before_counts[source] = before_counts.get(source, 0) + 1
+
+            kept_chunks: list[dict[str, Any]] = []
+            removed_chunks = 0
+            removed_sources: set[str] = set()
+            for row in self._chunks:
+                source = str(row.get("source", ""))
+                if source and source.lower() in normalized_targets:
+                    removed_chunks += 1
+                    removed_sources.add(source)
+                    continue
+                kept_chunks.append(row)
+
+            self._chunks = kept_chunks
+            self._rebuild_stats()
+            self._save()
+
+            removed_lower = {item.lower() for item in removed_sources}
+            missing_sources = [item for item in requested if item.lower() not in removed_lower]
+            return {
+                "requested_sources": requested,
+                "removed_sources": sorted(removed_sources),
+                "missing_sources": missing_sources,
+                "removed_chunks": removed_chunks,
+                "total_chunks": len(self._chunks),
+                "updated_at": self._updated_at,
+            }
+
     def _to_result(self, score: float, chunk: dict[str, Any]) -> dict[str, Any]:
         return {
             "score": round(score, 4),
@@ -211,7 +435,12 @@ class RagStore:
             "id": chunk["id"],
         }
 
-    def search(self, query: str, top_k: int = 4) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 4,
+        source_filter: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             if not self._chunks:
                 return []
@@ -219,13 +448,42 @@ class RagStore:
             if not query_tokens:
                 return []
 
-            n_docs = len(self._chunks)
+            strict_source_filter = source_filter is not None
+            normalized_filter = {
+                _normalize_source_path(item)
+                for item in (source_filter or [])
+                if str(item or "").strip()
+            }
+            if strict_source_filter and not normalized_filter:
+                return []
+
+            if strict_source_filter:
+                search_chunks = [
+                    chunk
+                    for chunk in self._chunks
+                    if _normalize_source_path(str(chunk.get("source", ""))) in normalized_filter
+                ]
+            else:
+                search_chunks = list(self._chunks)
+
+            if not search_chunks:
+                return []
+
+            local_doc_freq: dict[str, int] = {}
+            total_terms = 0
+            for chunk in search_chunks:
+                tokens = [str(token) for token in chunk.get("tokens", []) if str(token)]
+                total_terms += len(tokens)
+                for token in set(tokens):
+                    local_doc_freq[token] = local_doc_freq.get(token, 0) + 1
+
+            n_docs = len(search_chunks)
             k1 = 1.6
             b = 0.75
-            avg_len = self._avg_chunk_len if self._avg_chunk_len > 0 else 1.0
+            avg_len = (total_terms / n_docs) if n_docs > 0 else 1.0
 
             scores: list[tuple[float, dict[str, Any]]] = []
-            for chunk in self._chunks:
+            for chunk in search_chunks:
                 freq: dict[str, int] = {}
                 for token in chunk["tokens"]:
                     freq[token] = freq.get(token, 0) + 1
@@ -236,7 +494,7 @@ class RagStore:
                     tf = freq.get(token, 0)
                     if tf == 0:
                         continue
-                    df = self._doc_freq.get(token, 0)
+                    df = local_doc_freq.get(token, 0)
                     idf = math.log(1 + (n_docs - df + 0.5) / (df + 0.5))
                     denom = tf + k1 * (1 - b + b * (doc_len / avg_len))
                     score += idf * ((tf * (k1 + 1)) / denom)
@@ -251,5 +509,5 @@ class RagStore:
 
             # Fallback for low-overlap queries (e.g., "summarize the document"):
             # return newest chunks so the model still gets document context.
-            fallback_chunks = self._chunks[-limit:]
+            fallback_chunks = search_chunks[-limit:]
             return [self._to_result(0.0, chunk) for chunk in reversed(fallback_chunks)]

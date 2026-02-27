@@ -85,6 +85,34 @@ def _load_training_data(load_dataset: Any, dataset_path: Path):
     _fail(f"Unsupported dataset format: {dataset_path.suffix}. Use JSON/JSONL/CSV.")
 
 
+def _friendly_hf_access_error(base_model: str, exc: Exception) -> str:
+    raw = str(exc or "")
+    lowered = raw.lower()
+
+    if "gated repo" in lowered or "access to model" in lowered or "401 client error" in lowered:
+        return (
+            f"Cannot access Hugging Face model '{base_model}'.\n"
+            "This model appears gated/private.\n"
+            "Use an open model ID (recommended: TinyLlama/TinyLlama-1.1B-Chat-v1.0), or authenticate:\n"
+            "1) Request access on huggingface.co for the target model.\n"
+            "2) Run: huggingface-cli login\n"
+            "3) Or set HF_TOKEN in your environment.\n"
+            f"Original error: {raw}"
+        )
+
+    if "repository not found" in lowered or "404 client error" in lowered:
+        return (
+            f"Model repository not found: '{base_model}'.\n"
+            "Check the model ID or provide a valid local model directory.\n"
+            f"Original error: {raw}"
+        )
+
+    return (
+        f"Failed to load model/tokenizer '{base_model}'.\n"
+        f"Original error: {raw}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train LoRA adapter with Hugging Face + PEFT")
     parser.add_argument("--base-model", required=True, help="HF model ID or local model directory")
@@ -135,17 +163,23 @@ def main() -> None:
         _fail("No valid training rows were found after formatting.")
 
     print(f"Loading tokenizer: {args.base_model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+    except Exception as exc:
+        _fail(_friendly_hf_access_error(args.base_model, exc))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     print(f"Loading base model: {args.base_model}")
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        )
+    except Exception as exc:
+        _fail(_friendly_hf_access_error(args.base_model, exc))
 
     target_modules = [name.strip() for name in args.target_modules.split(",") if name.strip()]
     if not target_modules:
@@ -225,4 +259,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

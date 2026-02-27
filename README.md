@@ -261,12 +261,17 @@ What the web UI includes:
 - Streaming chat interface with full generation controls.
 - Runtime controls to start/stop local `llama-server`.
 - RAG indexing over local files/folders for retrieval-augmented responses.
-- Training job panel to launch LoRA fine-tune runs using `webui/train_adapter.py`.
+- Training job panel for BitNet-native continued training using `webui/train_bitnet.py`.
 
 Optional training dependencies:
 ```bash
 python -m pip install -r webui/requirements-train.txt
 ```
+
+If training fails with `No module named 'triton'`, install the platform runtime and restart the Web UI:
+- Windows: `python -m pip install triton-windows`
+- Linux: `python -m pip install triton`
+- macOS: use a Linux/WSL environment for BitNet continued training
 
 ### Benchmark
 We provide scripts to run the inference benchmark providing a model.

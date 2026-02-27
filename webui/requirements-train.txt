@@ -1,6 +1,7 @@
 torch>=2.2.0
 transformers>=4.42.0
 datasets>=2.20.0
-peft>=0.11.0
 accelerate>=0.31.0
-
+onebitllms
+triton-windows; platform_system == "Windows"
+triton; platform_system == "Linux"

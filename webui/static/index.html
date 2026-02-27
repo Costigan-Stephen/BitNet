@@ -4,158 +4,301 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>BitNet Command Deck</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260227c" />
   </head>
   <body>
     <div class="bg-layer"></div>
     <header class="topbar">
-      <div class="brand">
-        <span class="brand-kicker">BitNet</span>
-        <h1>Command Deck</h1>
+      <div class="topbar-brand">
+        <div style="display: flex; flex-direction: column;">
+          <span class="topbar-kicker">BitNet</span>
+          <span class="topbar-title">Command Deck</span>
+        </div>
       </div>
       <div class="top-actions">
-        <button id="clearChatBtn" class="btn subtle">Clear Chat</button>
-        <button id="saveSessionBtn" class="btn subtle">Save Session</button>
-        <label class="btn subtle file-btn">
-          Load Session
-          <input id="loadSessionInput" type="file" accept=".json" />
-        </label>
-      </div>
-      <div class="statusline">
-        <span id="healthBadge" class="badge muted">Checking...</span>
-        <span id="llamaBadge" class="badge muted">Server unknown</span>
+        <div class="theme-toggle">
+          <span>Dark Mode</span>
+          <label class="switch theme-switch" for="themeToggleInput" aria-label="Toggle dark mode">
+            <input id="themeToggleInput" type="checkbox" />
+            <span class="slider round"></span>
+          </label>
+        </div>
+        <div class="statusline">
+          <span id="healthBadge" class="badge muted">Checking...</span>
+          <span id="llamaBadge" class="badge muted">Server unknown</span>
+        </div>
       </div>
     </header>
 
     <main class="layout">
-      <section class="chat-panel panel">
-        <div id="chatFeed" class="chat-feed"></div>
-
-        <div class="composer">
-          <textarea id="userInput" rows="3" placeholder="Ask something..."></textarea>
-          <div class="composer-row">
-            <label class="check-wrap">
-              <input id="ragEnabled" type="checkbox" checked />
-              Use RAG context
-            </label>
-            <div class="composer-buttons">
-              <button id="stopBtn" class="btn warn" disabled>Stop</button>
-              <button id="sendBtn" class="btn accent">Send</button>
+      <aside class="command-rail panel">
+        <section class="rail-section rail-profile">
+          <div class="rail-row">
+            <label class="rail-label">Profile</label>
+            <div class="workspace-profile-controls">
+              <button id="createWorkspaceProfileBtn" class="btn subtle icon-add"></button>
+              <button id="saveWorkspaceProfileBtn" class="btn subtle icon-save"></button>
+              <button id="deleteWorkspaceProfileBtn" class="btn subtle icon-delete"></button>
             </div>
           </div>
-          <div class="quick-tests">
-            <button class="chip" data-prompt="Summarize the key points in the indexed documents.">Summarize Corpus</button>
-            <button class="chip" data-prompt="List 5 potential regressions from recent code changes.">Regression Probe</button>
-            <button class="chip" data-prompt="Generate a JSON test plan for API endpoints.">JSON Test Plan</button>
-          </div>
-        </div>
-      </section>
+          <select id="workspaceProfileSelect" class="workspace-profile-select"></select>
+        </section>
 
-      <aside class="sidebar panel">
-        <nav class="tab-nav">
-          <button class="tab-btn active" data-tab="runtime">Runtime</button>
-          <button class="tab-btn" data-tab="generation">Generation</button>
-          <button class="tab-btn" data-tab="rag">RAG</button>
+        <nav class="tab-nav rail-section" aria-label="Main sections">
+          <button class="tab-btn" data-tab="settings">Settings</button>
+          <button class="tab-btn" data-tab="models">Models</button>
+          <button class="tab-btn" data-tab="rag">RAG Context</button>
           <button class="tab-btn" data-tab="training">Training</button>
-          <button class="tab-btn" data-tab="inspector">Inspector</button>
+          <button class="tab-btn active" data-tab="chat">Chat</button>
         </nav>
 
-        <section class="tab-panel active" data-panel="runtime">
-          <h3>Runtime</h3>
-          <label>Model path</label>
-          <input id="modelPathInput" type="text" value="models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf" />
-          <div class="inline-grid">
-            <div>
-              <label>Host</label>
-              <input id="serverHostInput" type="text" value="127.0.0.1" />
-            </div>
-            <div>
-              <label>Port</label>
-              <input id="serverPortInput" type="number" value="8080" />
-            </div>
-            <div>
-              <label>Threads</label>
-              <input id="threadsInput" type="number" value="8" />
-            </div>
-            <div>
-              <label>Ctx</label>
-              <input id="ctxSizeInput" type="number" value="2048" />
-            </div>
+        <section class="rail-section rail-conversations">
+          <div class="rail-row">
+            <label class="rail-label">Conversations</label>
+            <button id="newConversationBtn" class="btn subtle mini icon-add" type="button"></button>
           </div>
-          <div class="button-row">
-            <button id="startServerBtn" class="btn accent">Start Server</button>
-            <button id="stopServerBtn" class="btn warn">Stop Server</button>
+          <div id="conversationList" class="conversation-list"></div>
+        </section>
+      </aside>
+
+      <section class="content-stage panel">
+        <section class="tab-panel chat-panel active" data-panel="chat">
+          <div class="chat-runtime-bar">
+            <span id="chatRuntimeLabel" class="chat-runtime-label"></span>
+          </div>
+          <div id="chatFeed" class="chat-feed"></div>
+
+          <div class="composer">
+            <div class="composer-input-wrap">
+              <textarea id="userInput" rows="3" placeholder="Ask Something..."></textarea>
+              <div class="composer-buttons">
+                <button id="stopBtn" class="btn warn" hidden disabled>Stop</button>
+                <button id="sendBtn" class="btn accent">Send</button>
+              </div>
+            </div>
+            <div class="composer-row">
+              <button id="clearChatBtn" class="btn subtle mini icon-delete">Clear Chat</button>
+              <label id="ragContextToggleWrap" class="check-wrap">
+                <input id="ragEnabled" type="checkbox" checked />
+                <span id="ragContextLabel">USE RAG CONTEXT</span>
+              </label>
+              <div class="composer-right">
+                <div id="tokenUsageBadge" class="token-usage">Ctx ~0 tok | Last: n/a</div>
+              </div>
+            </div>
+            <div class="quick-tests">
+              <button class="chip" data-prompt="Summarize the key points in the indexed documents.">Summarize Corpus</button>
+              <button class="chip" data-prompt="List 5 potential regressions from recent code changes.">Regression Probe</button>
+              <button class="chip" data-prompt="Generate a JSON test plan for API endpoints.">JSON Test Plan</button>
+            </div>
           </div>
         </section>
 
-        <section class="tab-panel" data-panel="generation">
-          <h3>Generation</h3>
-          <label>System prompt</label>
-          <textarea id="systemPromptInput" rows="3" placeholder="Optional high-level instructions for the assistant"></textarea>
+        <section class="tab-panel" data-panel="settings">
+          <h3>Settings</h3>
+          <nav class="settings-subtabs">
+            <button class="settings-subtab-btn active" data-settings-subtab="runtime">Runtime</button>
+            <button class="settings-subtab-btn" data-settings-subtab="generation">Generation</button>
+            <button class="settings-subtab-btn" data-settings-subtab="inspector">Inspector</button>
+          </nav>
+
+          <section class="settings-subtab-panel active" data-settings-subpanel="runtime">
+            <label>Runtime model</label>
+            <select id="modelPathInput"></select>
+            <p id="runtimeModelPathNote" class="small-note">Select a model profile to use for llama-server runtime.</p>
+            <div class="inline-grid">
+              <div>
+                <label>Host</label>
+                <input id="serverHostInput" type="text" value="127.0.0.1" />
+              </div>
+              <div>
+                <label>Port</label>
+                <input id="serverPortInput" type="number" value="8080" />
+              </div>
+              <div>
+                <label>Threads</label>
+                <input id="threadsInput" type="number" value="8" />
+              </div>
+              <div>
+                <label>Ctx</label>
+                <input id="ctxSizeInput" type="number" value="2048" />
+              </div>
+            </div>
+            <div class="button-row">
+              <button id="startServerBtn" class="btn accent">Start Server</button>
+              <button id="stopServerBtn" class="btn warn">Stop Server</button>
+            </div>
+            <div id="modelContextBar" class="model-context">Loading model context...</div>
+          </section>
+
+          <section class="settings-subtab-panel" data-settings-subpanel="generation">
+            <label>System prompt</label>
+            <textarea id="systemPromptInput" rows="3" placeholder="Optional high-level instructions for the assistant"></textarea>
+            <div class="inline-grid">
+              <div>
+                <label>Temperature</label>
+                <input id="temperatureInput" type="number" step="0.05" value="0.8" />
+              </div>
+              <div>
+                <label>Top P</label>
+                <input id="topPInput" type="number" step="0.05" value="0.95" />
+              </div>
+              <div>
+                <label>Max tokens</label>
+                <input id="maxTokensInput" type="number" value="512" />
+              </div>
+              <div>
+                <label>Repeat penalty</label>
+                <input id="repeatPenaltyInput" type="number" step="0.01" value="1.05" />
+              </div>
+              <div>
+                <label>RAG top-k</label>
+                <input id="ragTopKInput" type="number" value="4" />
+              </div>
+              <div>
+                <label>Seed (blank=random)</label>
+                <input id="seedInput" type="number" placeholder="" />
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-subtab-panel" data-settings-subpanel="inspector">
+            <pre id="inspector" class="code-box"></pre>
+          </section>
+        </section>
+
+        <section class="tab-panel" data-panel="models">
+          <h3>Custom Models</h3>
+          <p class="small-note">
+            Keep Base BitNet unchanged as fallback. Register custom GGUF variants and switch active profile for side-by-side comparisons.
+          </p>
+          <p class="small-note">
+            Admin workflow: link each model profile to a RAG profile so user context can switch automatically when models are activated.
+          </p>
+          <div class="button-row">
+            <button id="refreshModelsBtn" class="btn subtle">Refresh</button>
+            <button id="useBaseModelBtn" class="btn subtle">Use Base Model</button>
+          </div>
+          <label>Profile name</label>
+          <input id="modelProfileNameInput" type="text" placeholder="my-experiment-v1" />
+          <label>Model directory</label>
+          <div class="inline-action">
+            <input id="modelProfileDirInput" type="text" placeholder="C:\models\custom" />
+            <button id="browseModelDirBtn" class="btn subtle icon-open" type="button">Browse</button>
+          </div>
+          <label>Resolved model file (auto)</label>
+          <input id="modelProfileComputedPath" type="text" readonly />
+          <p class="small-note">Filename is generated from profile name, e.g. "Model" -> model.gguf. Browse uses your OS picker. By default, missing files are initialized by copying the base model.</p>
           <div class="inline-grid">
             <div>
-              <label>Temperature</label>
-              <input id="temperatureInput" type="number" step="0.05" value="0.8" />
+              <label class="check-wrap">
+                <input id="modelProfileSetActiveInput" type="checkbox" checked />
+                Set active on add
+              </label>
+              <label class="check-wrap">
+                <input id="modelProfileInitFromBaseInput" type="checkbox" checked />
+                Copy base model if missing
+              </label>
             </div>
-            <div>
-              <label>Top P</label>
-              <input id="topPInput" type="number" step="0.05" value="0.95" />
-            </div>
-            <div>
-              <label>Max tokens</label>
-              <input id="maxTokensInput" type="number" value="512" />
-            </div>
-            <div>
-              <label>Repeat penalty</label>
-              <input id="repeatPenaltyInput" type="number" step="0.01" value="1.05" />
-            </div>
-            <div>
-              <label>RAG top-k</label>
-              <input id="ragTopKInput" type="number" value="4" />
-            </div>
-            <div>
-              <label>Seed (blank=random)</label>
-              <input id="seedInput" type="number" placeholder="" />
+            <div class="button-row">
+              <button id="addModelProfileBtn" class="btn accent icon-add">Add Profile</button>
             </div>
           </div>
+          <div class="table-wrap">
+            <table class="data-table" id="modelsTable">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Status</th>
+                  <th>Model Path</th>
+                  <th>Linked RAG</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="modelsTableBody"></tbody>
+            </table>
+          </div>
+          <pre id="modelsStatus" class="code-box"></pre>
         </section>
+
 
         <section class="tab-panel" data-panel="rag">
           <h3>RAG Index</h3>
-          <label>Upload Files</label>
-          <p class="small-note">Supported: .txt, .md, .rst, .py, .json, .jsonl, .yaml, .yml, .csv, .log, .docx</p>
-          <input id="ragUploadInput" type="file" multiple />
-          <div class="button-row">
-            <button id="uploadRagBtn" class="btn accent">Upload + Index</button>
-          </div>
-          <label>Paths (one per line)</label>
-          <textarea id="ragPathsInput" rows="4" placeholder="E:\vsprojects\BitNet\docs&#10;E:\notes\project.md"></textarea>
-          <div class="inline-grid">
-            <div>
-              <label>Chunk size</label>
-              <input id="chunkSizeInput" type="number" value="220" />
+          <nav class="rag-subtabs">
+            <button class="rag-subtab-btn active" data-rag-subtab="files">Files</button>
+            <button class="rag-subtab-btn" data-rag-subtab="debug">Debug</button>
+          </nav>
+
+          <section class="rag-subtab-panel active" data-rag-subpanel="files">
+            <label>Upload Files</label>
+            <p class="small-note">RAG files are scoped to the active global profile.</p>
+            <p class="small-note">Supported: .txt, .md, .rst, .py, .json, .jsonl, .yaml, .yml, .csv, .log, .doc, .docx, .pdf</p>
+            <input id="ragUploadInput" type="file" multiple accept=".txt,.md,.rst,.py,.json,.jsonl,.yaml,.yml,.csv,.log,.doc,.docx,.pdf" />
+            <div class="button-row">
+              <button id="uploadRagBtn" class="btn accent">Upload + Index</button>
             </div>
-            <div>
-              <label>Overlap</label>
-              <input id="chunkOverlapInput" type="number" value="40" />
+            <label>Manual paths (optional, one per line)</label>
+            <textarea id="ragPathsInput" rows="4" placeholder="E:\vsprojects\BitNet\docs&#10;E:\notes\project.md"></textarea>
+            <div class="inline-grid">
+              <div>
+                <label>Chunk size</label>
+                <input id="chunkSizeInput" type="number" value="220" />
+              </div>
+              <div>
+                <label>Overlap</label>
+                <input id="chunkOverlapInput" type="number" value="40" />
+              </div>
             </div>
-          </div>
-          <div class="button-row">
-            <button id="indexRagBtn" class="btn accent">Index Paths</button>
-            <button id="resetRagBtn" class="btn subtle">Reset Index</button>
-          </div>
-          <pre id="ragStatus" class="code-box"></pre>
+            <div class="button-row">
+              <button id="indexRagBtn" class="btn accent">Index Paths</button>
+              <button id="resetRagBtn" class="btn subtle icon-delete">Reset Index</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="ragFilesTable">
+                <thead>
+                  <tr>
+                    <th>File</th>
+                    <th>Status</th>
+                    <th>Chunks</th>
+                    <th>Size</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="ragFilesTableBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="rag-subtab-panel" data-rag-subpanel="debug">
+            <label>Profile scope status</label>
+            <pre id="ragProfilesStatus" class="code-box"></pre>
+            <label>Selected file details</label>
+            <pre id="ragFileDetails" class="code-box"></pre>
+            <label>RAG index status</label>
+            <pre id="ragStatus" class="code-box"></pre>
+          </section>
         </section>
 
         <section class="tab-panel" data-panel="training">
           <h3>Training</h3>
           <p class="small-note">
-            This launches LoRA fine-tuning jobs for Hugging Face models (not direct in-place BitNet GGUF weight training).
+            This launches BitNet-native continued training (full checkpoint fine-tuning, not PEFT LoRA adapters).
           </p>
-          <label>Base model (HF id or local)</label>
-          <input id="trainBaseModelInput" type="text" value="meta-llama/Llama-3.2-1B-Instruct" />
-          <label>Upload dataset file (JSON/JSONL/CSV)</label>
-          <input id="trainUploadInput" type="file" accept=".json,.jsonl,.csv" />
+          <p class="small-note">
+            Use a BitNet-compatible checkpoint. Default uses Falcon-E prequantized weights. After training, export/convert to your runtime format (for example GGUF) if needed.
+          </p>
+          <label>Base model (HF id or local checkpoint)</label>
+          <input id="trainBaseModelInput" type="text" value="tiiuae/Falcon-E-1B-Base" />
+          <label>Model revision/branch</label>
+          <input id="trainModelRevisionInput" type="text" value="prequantized" />
+          <label>Tokenizer model (optional override)</label>
+          <input id="trainTokenizerModelInput" type="text" placeholder="tiiuae/Falcon-E-1B-Instruct" />
+          <label>Upload dataset or document file</label>
+          <input id="trainUploadInput" type="file" accept=".json,.jsonl,.csv,.txt,.md,.rst,.log,.doc,.docx,.pdf" />
+          <p class="small-note">
+            JSON/JSONL/CSV are used directly. Documents (.txt/.md/.rst/.log/.doc/.docx/.pdf) are auto-converted into JSONL training rows.
+          </p>
           <div class="button-row">
             <button id="uploadTrainBtn" class="btn subtle">Upload Dataset</button>
           </div>
@@ -180,7 +323,7 @@
           <label>Dataset path (JSON/JSONL/CSV)</label>
           <input id="trainDatasetInput" type="text" placeholder="E:\datasets\train.jsonl" />
           <label>Output directory</label>
-          <input id="trainOutputDirInput" type="text" value="training-output/adapter" />
+          <input id="trainOutputDirInput" type="text" value="training-output/bitnet" />
           <div class="inline-grid">
             <div>
               <label>Epochs</label>
@@ -203,22 +346,22 @@
               <input id="trainMaxSeqInput" type="number" value="1024" />
             </div>
             <div>
-              <label>LoRA rank</label>
-              <input id="trainLoraRankInput" type="number" value="16" />
+              <label>Quantize output to 1-bit</label>
+              <select id="trainQuantizeOutputInput">
+                <option value="false">No</option>
+                <option value="true">Yes</option>
+              </select>
             </div>
           </div>
           <div class="button-row">
             <button id="startTrainBtn" class="btn accent">Start Training</button>
             <button id="stopTrainBtn" class="btn warn">Stop Training</button>
           </div>
+          <p id="trainGuardNote" class="small-note"></p>
           <pre id="trainStatus" class="code-box"></pre>
         </section>
 
-        <section class="tab-panel" data-panel="inspector">
-          <h3>Inspector</h3>
-          <pre id="inspector" class="code-box"></pre>
-        </section>
-      </aside>
+      </section>
     </main>
 
     <template id="messageTemplate">
@@ -228,6 +371,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260227c"></script>
   </body>
 </html>
